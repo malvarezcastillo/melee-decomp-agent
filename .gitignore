@@ -1,0 +1,19 @@
+# External repos/tools (have their own git)
+melee/
+permuter/
+
+# Tools directory (large caches, sensitive data)
+tools/
+
+# Worktrees
+.worktrees/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editor
+.idea/
+.vscode/
+*.swp
