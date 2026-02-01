@@ -15,7 +15,7 @@ __pycache__/
 .vscode/
 *.swp
 
-# Tools - large caches and sensitive data
+# Tools - caches and local data
 tools/.embeddings_cache.json
 tools/.easy_cache.json
 tools/.env
@@ -26,8 +26,3 @@ tools/*.log
 tools/.submitted_prs
 tools/.difficult_functions*
 tools/.blacklist
-tools/m2c_batch_results.json
-tools/permute_*.txt
-tools/permuter_matches_*.txt
-tools/vacuum_permute_*.txt
-tools/*_manual_integration.md
