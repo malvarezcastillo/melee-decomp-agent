@@ -168,7 +168,7 @@ def disassemble_function(obj_path: Path, func_name: str) -> str | None:
         return None
 
     result = subprocess.run(
-        [str(OBJDUMP), "-d", str(obj_path)],
+        [str(get_objdump_cmd()), "-d", str(obj_path)],
         capture_output=True, text=True, timeout=30
     )
 
@@ -725,7 +725,7 @@ def cmd_list(limit: int = 50):
 
         # Get function count
         result = subprocess.run(
-            [str(OBJDUMP), "-t", str(target_path)],
+            [str(get_objdump_cmd()), "-t", str(target_path)],
             capture_output=True, text=True, timeout=10
         )
 
@@ -759,7 +759,7 @@ def cmd_funcs(unit_name: str):
     target_path = MELEE_REPO / unit.get("target_path", "")
 
     result = subprocess.run(
-        [str(OBJDUMP), "-t", str(target_path)],
+        [str(get_objdump_cmd()), "-t", str(target_path)],
         capture_output=True, text=True
     )
 
@@ -1333,6 +1333,11 @@ def load_embeddings_cache(ignore_hash: bool = False) -> dict | None:
     Args:
         ignore_hash: If True, load cache even if objdiff.json has changed.
                      Used for sync operations that just update decompiled flags.
+
+    When ignore_hash is False and the hash doesn't match, the cache is still
+    returned (embeddings are still valid) but a warning is printed. The hash
+    mismatch typically means the repo was rebuilt since the last index, so
+    decompiled flags may be slightly stale.
     """
     if not EMBEDDINGS_CACHE.exists():
         return None
@@ -1342,7 +1347,11 @@ def load_embeddings_cache(ignore_hash: bool = False) -> dict | None:
             cache = json.load(f)
 
         if not ignore_hash and cache.get("objdiff_hash") != get_objdiff_hash():
-            return None
+            if cache.get("functions"):
+                print("Note: embeddings cache is stale (objdiff.json changed). "
+                      "Run 'tools.py index' to update.", file=sys.stderr)
+            else:
+                return None
 
         return cache
     except (json.JSONDecodeError, KeyError):
@@ -1475,7 +1484,7 @@ def cmd_index(refresh: bool = False, sync: bool = False):
         funcs = []
         try:
             result = subprocess.run(
-                [str(OBJDUMP), "-t", str(target_path)],
+                [str(get_objdump_cmd()), "-t", str(target_path)],
                 capture_output=True, text=True, timeout=10
             )
             for line in result.stdout.split("\n"):
@@ -3475,6 +3484,335 @@ def cmd_skip(func_name: str = None, reason: str = "", clean: bool = False):
     print(f"Added {func_name} to skip list.")
 
 
+# ---------------------------------------------------------------------------
+# compare command - diff two report.json files (like the CI bot report)
+# ---------------------------------------------------------------------------
+
+COMPARE_CACHE_DIR = MELEE_AI / ".compare_cache"
+
+
+def _build_item_index(report):
+    """Build lookup of (unit_name, item_name) -> {size, pct, type}."""
+    index = {}
+    for unit in report.get("units", []):
+        unit_name = unit["name"]
+        for func in unit.get("functions", []):
+            pct = func.get("fuzzy_match_percent")
+            if pct is None:
+                pct = 0.0
+            index[(unit_name, func["name"])] = {
+                "size": int(func.get("size", 0)),
+                "pct": pct,
+                "type": "function",
+            }
+        for sec in unit.get("sections", []):
+            pct = sec.get("fuzzy_match_percent")
+            if pct is None:
+                pct = 0.0
+            index[(unit_name, sec["name"])] = {
+                "size": int(sec.get("size", 0)),
+                "pct": pct,
+                "type": "section",
+            }
+    return index
+
+
+def _compare_reports(before_report, after_report):
+    """Compare two reports and return structured diff."""
+    before_idx = _build_item_index(before_report)
+    after_idx = _build_item_index(after_report)
+
+    all_keys = set(before_idx.keys()) | set(after_idx.keys())
+
+    new_matches = []
+    broken_matches = []
+    improvements = []
+    regressions = []
+
+    for key in sorted(all_keys):
+        before = before_idx.get(key, {"size": 0, "pct": 0.0, "type": "function"})
+        after = after_idx.get(key, {"size": 0, "pct": 0.0, "type": "function"})
+
+        b_pct = before["pct"]
+        a_pct = after["pct"]
+        size = after.get("size") or before.get("size") or 0
+
+        if b_pct == a_pct:
+            continue
+
+        bytes_change = int(round(size * (a_pct - b_pct) / 100))
+        unit_name, item_name = key
+
+        entry = {
+            "unit": unit_name,
+            "name": item_name,
+            "bytes": bytes_change,
+            "before_pct": b_pct,
+            "after_pct": a_pct,
+            "size": size,
+        }
+
+        if a_pct == 100.0 and b_pct < 100.0:
+            new_matches.append(entry)
+        elif b_pct == 100.0 and a_pct < 100.0:
+            broken_matches.append(entry)
+        elif a_pct > b_pct:
+            improvements.append(entry)
+        else:
+            regressions.append(entry)
+
+    return {
+        "new_matches": sorted(new_matches, key=lambda x: -x["bytes"]),
+        "broken_matches": sorted(broken_matches, key=lambda x: x["bytes"]),
+        "improvements": sorted(improvements, key=lambda x: -x["bytes"]),
+        "regressions": sorted(regressions, key=lambda x: x["bytes"]),
+        "before_measures": before_report.get("measures", {}),
+        "after_measures": after_report.get("measures", {}),
+    }
+
+
+def _format_table(entries, show_sign=True):
+    """Format entries as an aligned table."""
+    if not entries:
+        return "  (none)\n"
+
+    # Calculate column widths
+    rows = []
+    for e in entries:
+        b = f"{e['bytes']:+d}" if show_sign else str(e["bytes"])
+        rows.append((e["unit"], e["name"], b,
+                      f"{e['before_pct']:.2f}%", f"{e['after_pct']:.2f}%"))
+
+    headers = ("Unit", "Item", "Bytes", "Before", "After")
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells):
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+
+    lines = [fmt_row(headers)]
+    for row in rows:
+        lines.append(fmt_row(row))
+    return "\n".join(lines) + "\n"
+
+
+def _get_commit_hash(ref):
+    """Resolve a git ref to a commit hash."""
+    result = subprocess.run(
+        ["git", "-C", str(MELEE_REPO), "rev-parse", ref],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _get_short_hash(ref):
+    """Get short hash for display."""
+    result = subprocess.run(
+        ["git", "-C", str(MELEE_REPO), "rev-parse", "--short", ref],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return ref
+    return result.stdout.strip()
+
+
+def _build_base_report(base_ref):
+    """Build report.json for a base ref, using cache if available."""
+    commit_hash = _get_commit_hash(base_ref)
+    if not commit_hash:
+        print(f"Error: Could not resolve ref '{base_ref}'", file=sys.stderr)
+        sys.exit(1)
+
+    # Check cache
+    COMPARE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = COMPARE_CACHE_DIR / f"{commit_hash}.json"
+    if cache_path.exists():
+        print(f"Using cached report for {base_ref} ({commit_hash[:8]})")
+        with open(cache_path) as f:
+            return json.load(f)
+
+    # Build in temp worktree (resolve the main repo root via git)
+    result = subprocess.run(
+        ["git", "-C", str(MELEE_REPO), "rev-parse", "--path-format=absolute",
+         "--git-common-dir"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        # git-common-dir points to .git of the main worktree
+        git_common = Path(result.stdout.strip())
+        repo_root = git_common.parent  # parent of the .git dir
+    else:
+        repo_root = MELEE_REPO
+    worktree_parent = repo_root.parent / ".worktrees"
+    worktree_path = worktree_parent / f"_compare_tmp_{commit_hash[:8]}"
+    print(f"Building base report for {base_ref} ({commit_hash[:8]})...")
+    print(f"  Creating temp worktree at {worktree_path}")
+
+    try:
+        subprocess.run(
+            ["git", "-C", str(MELEE_REPO), "worktree", "add",
+             "--detach", str(worktree_path), commit_hash],
+            check=True, capture_output=True, text=True,
+        )
+
+        # Set up build dependencies (same as setup-worktree)
+        main_repo = Path(result.stdout.strip()).parent if result.returncode == 0 else repo_root
+        main_repo = repo_root
+
+        # Symlink orig directory (remove git placeholder if present)
+        orig_src = main_repo / "orig"
+        orig_dst = worktree_path / "orig"
+        if orig_src.exists():
+            if orig_dst.exists() and not orig_dst.is_symlink():
+                import shutil
+                shutil.rmtree(str(orig_dst))
+            if not orig_dst.exists():
+                orig_dst.symlink_to(orig_src)
+
+        # Symlink build dependencies (binutils, compilers, tools)
+        build_dir = worktree_path / "build"
+        build_dir.mkdir(exist_ok=True)
+        for dep in ("binutils", "compilers", "tools"):
+            dep_src = main_repo / "build" / dep
+            dep_dst = build_dir / dep
+            if dep_src.exists() and not dep_dst.exists():
+                dep_dst.symlink_to(dep_src)
+
+        # Run configure.py
+        print("  Running configure.py...")
+        result = subprocess.run(
+            ["python3", "configure.py"],
+            cwd=str(worktree_path),
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  configure.py failed: {result.stderr[:300]}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        print("  Running ninja (this may take a while)...")
+        result = subprocess.run(
+            ["ninja"],
+            cwd=str(worktree_path),
+            capture_output=True, text=True,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            print(f"  ninja failed:\n{result.stderr[-500:]}", file=sys.stderr)
+            sys.exit(1)
+
+        report_path = worktree_path / "build/GALE01/report.json"
+        if not report_path.exists():
+            print("Error: ninja did not produce report.json", file=sys.stderr)
+            sys.exit(1)
+
+        # Cache the result
+        import shutil
+        shutil.copy2(str(report_path), str(cache_path))
+        print(f"  Cached report at {cache_path}")
+
+        with open(report_path) as f:
+            return json.load(f)
+    finally:
+        # Clean up temp worktree
+        print("  Cleaning up temp worktree...")
+        subprocess.run(
+            ["git", "-C", str(MELEE_REPO), "worktree", "remove",
+             "--force", str(worktree_path)],
+            capture_output=True, text=True,
+        )
+
+
+def cmd_compare(base_ref=None, before_path=None, after_path=None):
+    """Compare two report.json files and display gains/losses report."""
+    if before_path and after_path:
+        with open(before_path) as f:
+            before_report = json.load(f)
+        with open(after_path) as f:
+            after_report = json.load(f)
+        before_label = str(before_path)
+        after_label = str(after_path)
+    elif base_ref:
+        after_report_path = MELEE_REPO / "build/GALE01/report.json"
+        if not after_report_path.exists():
+            print("Error: No report.json found. Run 'ninja' first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        with open(after_report_path) as f:
+            after_report = json.load(f)
+        before_report = _build_base_report(base_ref)
+        before_label = _get_short_hash(base_ref)
+        after_label = _get_short_hash("HEAD")
+    else:
+        print("Usage: tools.py compare <base_ref>", file=sys.stderr)
+        print("       tools.py compare --reports <before.json> <after.json>",
+              file=sys.stderr)
+        sys.exit(1)
+
+    diff = _compare_reports(before_report, after_report)
+
+    # Header
+    before_m = diff["before_measures"]
+    after_m = diff["after_measures"]
+
+    after_pct = float(after_m.get("matched_code_percent", 0))
+    before_pct = float(before_m.get("matched_code_percent", 0))
+    pct_delta = after_pct - before_pct
+
+    after_bytes = int(after_m.get("matched_code", 0))
+    before_bytes = int(before_m.get("matched_code", 0))
+    bytes_delta = after_bytes - before_bytes
+
+    sign = "+" if pct_delta >= 0 else ""
+    bsign = "+" if bytes_delta >= 0 else ""
+
+    print(f"\nReport for GALE01 ({before_label} - {after_label})")
+    print(f"Matched code: {after_pct:.2f}% "
+          f"({sign}{pct_delta:.2f}%, {bsign}{bytes_delta} bytes)")
+    print()
+
+    # New matches
+    n = len(diff["new_matches"])
+    if n > 0:
+        print(f"NEW MATCHES ({n})")
+        print(_format_table(diff["new_matches"]))
+
+    # Broken matches
+    n = len(diff["broken_matches"])
+    if n > 0:
+        print(f"BROKEN MATCHES ({n})")
+        print(_format_table(diff["broken_matches"]))
+
+    # Improvements
+    n = len(diff["improvements"])
+    if n > 0:
+        print(f"IMPROVEMENTS ({n})")
+        print(_format_table(diff["improvements"]))
+
+    # Regressions (non-100% items that got worse)
+    n = len(diff["regressions"])
+    if n > 0:
+        print(f"REGRESSIONS ({n})")
+        print(_format_table(diff["regressions"]))
+
+    # Summary
+    total_new = sum(e["bytes"] for e in diff["new_matches"])
+    total_broken = sum(e["bytes"] for e in diff["broken_matches"])
+    total_improved = sum(e["bytes"] for e in diff["improvements"])
+    total_regressed = sum(e["bytes"] for e in diff["regressions"])
+
+    print("Summary:")
+    print(f"  New matches:   {len(diff['new_matches']):>4} items, {total_new:+d} bytes")
+    print(f"  Broken:        {len(diff['broken_matches']):>4} items, {total_broken:+d} bytes")
+    print(f"  Improvements:  {len(diff['improvements']):>4} items, {total_improved:+d} bytes")
+    print(f"  Regressions:   {len(diff['regressions']):>4} items, {total_regressed:+d} bytes")
+    print(f"  Net change:    {bsign}{bytes_delta} bytes")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: tools.py <command> [args]")
@@ -3504,6 +3842,11 @@ def main():
         print("  infer [--struct X]   - Infer types for unknown fields from usage")
         print("  suggest <func>       - Analyze assembly to suggest field types")
         print("  field-usage <struct> <field> - Show all usages of a struct field")
+        print()
+        print("Comparison commands:")
+        print("  compare <base_ref>   - Compare current build against a base ref (e.g. master)")
+        print("  compare --reports <before.json> <after.json>")
+        print("                       - Compare two report.json files directly")
         print()
         print("Other commands:")
         print("  list                 - List incomplete units")
@@ -3623,6 +3966,20 @@ def main():
     elif cmd == "setup-worktree":
         name = sys.argv[2] if len(sys.argv) >= 3 else None
         cmd_setup_worktree(name)
+    elif cmd == "compare":
+        if "--reports" in sys.argv:
+            idx = sys.argv.index("--reports")
+            if idx + 2 < len(sys.argv):
+                cmd_compare(before_path=sys.argv[idx + 1],
+                            after_path=sys.argv[idx + 2])
+            else:
+                print("Usage: tools.py compare --reports <before.json> <after.json>",
+                      file=sys.stderr)
+                sys.exit(1)
+        elif len(sys.argv) >= 3:
+            cmd_compare(base_ref=sys.argv[2])
+        else:
+            cmd_compare()
     else:
         print(f"Unknown command or missing args: {cmd}", file=sys.stderr)
         sys.exit(1)

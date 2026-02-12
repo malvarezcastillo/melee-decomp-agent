@@ -6,6 +6,7 @@ LLM-assisted decompilation of Super Smash Bros. Melee (GameCube, US v1.02). Conv
 1. **NEVER modify files in `~/melee-decomp/melee` directly** - ALWAYS use git worktrees
 2. **ALWAYS set `MELEE_REPO`** environment variable when working in worktrees or `verify` reads wrong report.json
 3. **NEVER read USER.md** - it's for humans only, not relevant to your tasks
+4. **When replying to GitHub PR comments**, use quote formatting (`>`) — you're not the user
 
 ## Documentation Map
 
@@ -52,6 +53,10 @@ ninja && tools.py verify <func>  # AUTHORITATIVE verification
 # Quality
 quality_check.py <file.c>        # Catch issues before PR
 git clang-format                 # Fix code style
+
+# Comparison (like CI bot report)
+tools.py compare <base_ref>     # Compare current build vs base (e.g. master)
+tools.py compare --reports <before.json> <after.json>  # Compare two report files
 ```
 
 ## mwcc Compiler Constraints
@@ -110,6 +115,7 @@ git clang-format                 # Fix code style
 | `lfd` from `.rodata` | `1.0` literal | Double precision (no suffix) |
 | `fmr f1, f2` | Temp float or inline return | Float register move |
 | `fneg f1, f1` | `-float_var` | Float negation |
+| `lfs` for abs comparison | `__fabsf(x)` | Float-precision abs (vs `fabsf`/`fabs` which use `lfd`) |
 
 ### Bitfields, Loops, Switches
 
@@ -118,7 +124,8 @@ git clang-format                 # Fix code style
 | `rlwimi r3, r4, SH, MB, ME` | `struct.bitfield = val;` | Rotate and insert bits |
 | `rlwinm` with mask | `if (struct.bitfield)` | Extract and test bits |
 | `mtctr` + `bdnz` | `do { } while (--count > 0);` | Decrement-and-branch loop |
-| `lwzu`/`stwu` in loop | `*ptr++ = val;` | Load/store with update |
+| `lwzu`/`stwu` in loop | `*ptr++ = val;` | Load/store with update (post-increment) |
+| `stbu`/`stwu` single | `*++ptr = val;` | Store with update (pre-increment) |
 | `slwi` + `lwzx` + `mtctr` + `bctr` | `switch(var)` contiguous cases | Jump table |
 | Series of `cmpwi` + `beq`/`bgt` | `switch(var)` sparse cases | Binary search tree |
 
@@ -267,7 +274,7 @@ typedef struct {
 
 **Match percentage is necessary but NOT sufficient.** Prefer no match over a fake match.
 
-**Rejected patterns**: raw array access (`data[x*5+y][0]`), generic names (`arg0`), no documentation, convoluted pointer math, type punning (`*(s32*)&float`), redundant casts, nonsensical assignment order.
+**Rejected patterns**: raw array access (`data[x*5+y][0]`), generic names (`arg0`), no documentation, convoluted pointer math, type punning (`*(s32*)&float`), redundant casts, nonsensical assignment order, `BOOL`/`TRUE`/`FALSE` (use `bool`/`true`/`false`), bare `extern` in `.c` files (use headers), unnecessary casts (fix signatures instead).
 
 **Also rejected (sandbox artifacts)**:
 - `// Decompilation of X`, `// Unit: X`, `// m2c decompilation of` comments — strip before committing
@@ -317,6 +324,15 @@ Common TODO reasons:
 - `needs struct field fixes` — wrong struct layout or field access
 - `below 50% threshold, needs significant work` — for functions wrapped in `#if 0`
 
+## Naming Conventions
+
+- **Function names must match file**: `itFreeze_*` for `itfreeze.c`, not legacy `it_3F14_*`
+- **Non-static functions need module prefix**: `mnDiagram_*`, `grVenom_*`, etc.
+- **Never use community-sourced names** (Uncle Punch, etc.) — derive from code analysis only
+- **Symbol renames must update**: source, headers, AND `symbols.txt` (use `melee-replace-symbols`)
+- **Struct definitions go in `module/types.h`**, not in `.c` files
+- **Include style**: angle brackets for `baselib/`/`dolphin/` headers, quotes for project-local
+
 ## HAL Conventions
 
 - `fp` = Fighter*, `gobj` = HSD_GObj*, `da`/`attr` = attributes pointer
@@ -332,6 +348,7 @@ Common TODO reasons:
 - **Score not improving**: try different loop structures, reorder declarations, swap expression order, try `(s32)x` vs `(int)x`.
 - **Permuter errors**: add `typedef int TypeName;` stubs, `void func();` prototypes, or `extern int global;` to base.c.
 - **Epilogue scheduling**: "Build 167" scheduler bug. The patched `1.2.5n` compiler handles this.
+- **Builtin inline unwanted**: If target calls `fmod`/`fabs`/etc. as `bl` (not inlined) but mwcc inlines it, add a forward declaration like `float fmod(float, float);` to suppress the builtin. This prevents mwcc from using its internal inline expansion, which can cascade into completely wrong FP register allocation.
 - **Wrong field**: run `suggest` to see exact offsets, compare to struct definition in headers. Templates may use different fields.
 - **Context file**: `~/melee-decomp/tools/context.txt` is used by `scratch` and `permute` automatically. `scratch` cannot handle header inlines — use `ninja` + `verify` instead.
 
@@ -359,6 +376,18 @@ Common TODO reasons:
 4. **Update sandbox_claude.md too**: If it affects vacuum, update `~/melee-decomp/tools/sandbox_claude.md` to keep it in sync.
 
 **The docs must stay current with reality.** Every new issue is a docs bug that needs fixing.
+
+## Experimental Pattern Tracking
+
+Claude Code sessions accumulate decomp patterns in `memory/experimental-patterns.md` (in the Claude Code memory directory). After solving a non-trivial decomp problem:
+
+1. Check if the pattern is already in experimental-patterns.md — if so, increment votes and add context
+2. If it's new, add an entry with 1 vote
+3. If a pattern reaches 3 votes, suggest promotion to the user
+
+**Promotion** (user-approved only): Add the pattern to the appropriate section of this file AND sync to `tools/sandbox_claude.md`.
+
+At the start of decomp work, skim experimental-patterns.md for potentially useful heuristics.
 
 ## Keeping Docs Synchronized
 

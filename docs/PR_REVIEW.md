@@ -39,6 +39,45 @@ Common TODO reasons:
 - `needs struct field fixes` - wrong struct layout or field access
 - `needs permuter` - at 99%+ but small diff remains
 
+## Naming Conventions
+
+### Function Names Must Match File
+
+Function names must match the current file naming convention, not legacy split-file names:
+
+```c
+// ❌ BAD - legacy unsplit name in itfreeze.c
+void it_3F14_Logic17_Destroyed(Item_GObj* gobj)
+
+// ✓ GOOD - matches file name
+void itFreeze_Destroyed(Item_GObj* gobj)
+```
+
+### Module Prefix Required on Non-Static Functions
+
+All non-static functions must use the module prefix:
+
+```c
+// ❌ BAD - missing module prefix
+void UpdateScrollArrows(HSD_GObj* gobj)
+
+// ✓ GOOD - module prefix present
+void mnDiagram_UpdateScrollArrows(HSD_GObj* gobj)
+```
+
+### No Community-Sourced Names
+
+**Never pull names from Uncle Punch, training mode mods, or other community sources.** Names must be derived from code analysis only. If you can't determine the real name, use placeholder field names like `x2C` and document that naming is pending.
+
+### Symbol Renames Must Be Comprehensive
+
+When renaming functions, update ALL of:
+1. Source files (`.c`)
+2. Header files (`.h`)
+3. `symbols.txt`
+
+Use the `melee-replace-symbols` tool or `tools/functions.sh rename_tu` for mass renames.
+
 ## Rejected Patterns (Will Fail Review)
 
 ### 1. Sandbox Artifacts
@@ -120,6 +159,8 @@ Auto-detected by quality_check.py as WARNING.
 // ✓ GOOD - proper struct field access
 ip->xDD4_itemVar.box.someField = value;
 ```
+
+Use `M2C_FIELD` as a fallback for unknown offsets (m2c `--valid-syntax` generates these automatically). But defining the actual struct field is always preferred.
 
 Auto-detected by quality_check.py as ERROR.
 
@@ -227,6 +268,102 @@ void itBox_OnExplosion(Item_GObj* gobj)
 
 Auto-detected by quality_check.py as INFO.
 
+### 11. Unnecessary Casts
+
+**FIX THE ROOT CAUSE** (function signatures, types) instead of adding casts:
+
+```c
+// ❌ BAD - casting to paper over type mismatch
+Item_GObj_Callback cb = (void (*)(HSD_GObj*)) fn_802BB428;
+
+// ✓ GOOD - fix fn_802BB428's declaration to match
+Item_GObj_Callback cb = fn_802BB428;
+
+// ❌ BAD - unnecessary cast when types already match
+doSomething((HSD_GObj*) gobj);  // gobj is already Item_GObj*
+
+// ✓ GOOD - no cast needed
+doSomething(gobj);
+```
+
+### 12. Bare Extern Declarations in .c Files
+
+**INCLUDE THE PROPER HEADER** instead of adding `extern` in source files:
+
+```c
+// ❌ BAD - bare extern in .c file
+extern u8 un_804D6FFC;
+
+// ✓ GOOD - include or create the header
+#include "vi/types.h"
+```
+
+If a symbol is only referenced from one file, it may belong to that translation unit — check the splits.
+
+### 13. Wrong Boolean Style
+
+**USE `bool`/`true`/`false`**, not `BOOL`/`TRUE`/`FALSE`:
+
+```c
+// ❌ BAD - Windows-style macros
+BOOL result = TRUE;
+if (result == FALSE) { ... }
+
+// ✓ GOOD - C99 stdbool style
+bool result = true;
+if (result == false) { ... }
+```
+
+### 14. Placeholder Prototype Removal
+
+**NEVER remove `UNK_RET`/`UNK_PARAMS` placeholder prototypes from headers.** They preserve function ordering and satisfy `--require-protos`. Replace them with real prototypes when you implement the function, but don't delete them.
+
+## Code Organization
+
+### Struct Definitions Go in `module/types.h`
+
+New struct definitions belong in the module's `types.h`, not in `.c` files or regular `.h` files:
+
+```
+src/melee/it/types.h     # Item types
+src/melee/ft/types.h     # Fighter types
+src/melee/gr/types.h     # Ground/Stage types
+src/melee/mn/types.h     # Menu types
+src/melee/cm/types.h     # Camera types
+```
+
+### Static Data Placement
+
+Static data definitions (like `AnimLoopSettings`) go at the top of the file or in the `.static.h` file, not interleaved between functions.
+
+### Inline Helpers in Shared Headers
+
+Reusable `static inline` functions belong in shared headers, not local to one file. If a similar inline already exists in a header (e.g., `controller.h`), add yours next to it.
+
+### Include Style
+
+```c
+// Angle brackets for library/baselib headers
+#include <baselib/psstructs.h>
+#include <dolphin/os/OSError.h>
+
+// Quotes for project-local headers
+#include "it/types.h"
+#include "ft/forward.h"
+```
+
+### Use Project Macros
+
+```c
+// ❌ BAD - manual workarounds
+int stack_pad = 0; (void)stack_pad;  // stack padding
+int count = 25;                       // magic array size
+
+// ✓ GOOD - project macros
+PAD_STACK(4);
+int count = ARRAY_SIZE(sp18);
+```
+
 ## Style Requirements
 
 ### Float Literals
@@ -242,6 +379,20 @@ float y = 2.5F;
 ```
 
 Auto-detected by quality_check.py as WARNING.
+
+### Float Literals in Function Arguments
+
+**Use proper float/pointer types in function call arguments**, not bare integers:
+
+```c
+// ❌ BAD - integer literals where floats/pointers are expected
+Fighter_ChangeMotionState(gobj, 0x16A, 0, fp->cur_anim_frame, 1, 0, 0);
+
+// ✓ GOOD - correct types
+Fighter_ChangeMotionState(gobj, 0x16A, 0, fp->cur_anim_frame, 1.0F, 0.0F, NULL);
+```
+
+This is a common AI/LLM error — always check function prototypes for parameter types.
 
 ### Hex Literals
 
@@ -417,6 +568,61 @@ For each function you modified:
 ```
 
 **Better**: Use permuter or submit as <100% instead of fake matching.
+
+## PR Hygiene
+
+### No Build Artifacts or Unrelated Changes
+
+PRs must not include:
+- `.build_validated` files
+- `.gitkeep` changes
+- Unrelated file modifications (revert accidental touches)
+
+### No Regressions
+
+The decomp-dev bot tracks match percentages. If your PR **breaks previously-matched functions**, you must fix the regressions before merge. Check the bot's report carefully.
+
+### Fix Argument Types, Don't Cast Around Them
+
+When a function parameter doesn't match the expected type:
+
+```c
+// ❌ BAD - cast workaround
+void un_80321950(void* s)
+{
+    vi1202_UnkStruct* data = (vi1202_UnkStruct*)s;
+    // ...
+}
+
+// ✓ GOOD - correct argument type
+void un_80321950(vi1202_UnkStruct* s)
+{
+    // use s directly
+}
+```
+
+## AI-Generated Code Notes
+
+AI-generated code (Claude, Codex, etc.) receives the same review scrutiny as human code. Be transparent about AI usage in PR descriptions.
+
+**Common AI errors reviewers catch:**
+- Wrong union variant (m2c/LLM picks first alphabetical)
+- Integer literals where float/pointer args expected (`0` instead of `0.0F` or `NULL`)
+- Raw pointer arithmetic instead of struct fields
+- `goto` patterns that should be `continue` in loops
+- Nonsensical struct access through recast pointers
+- Missing module prefix on function names
+
+**When to prefer m2c over LLM**: For simple functions where the main challenge is type correctness, m2c with correct argument types often produces better results than an LLM. Use m2c `--valid-syntax` for clean output.
+
+## Key Reviewers
+
+Understanding reviewer focus areas helps prepare better PRs:
+
+- **ribbanya**: Type system integrity, struct definitions in types.h, `bool`/`true`/`false` style, no community-sourced names, code organization
+- **PsiLupan**: String access patterns, M2C_FIELD elimination, float literal correctness, item union types
+- **r-burns**: Unnecessary casts, proper struct fields over M2C_FIELD, function signature fixes
+- **sadkellz**: Camera struct correctness, speculative naming pushback, cross-referencing callers
 
 ## Final Reminders
 

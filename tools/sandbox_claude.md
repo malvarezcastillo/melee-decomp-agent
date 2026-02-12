@@ -48,7 +48,8 @@ Write C code that compiles to a 100% binary-identical match with the target asse
 | `lfs/stfs` | float field access | Use `F` suffix on literals |
 | `lbz/stb` | `u8`/`s8` field access | |
 | `lhz/sth` | `u16`/`s16` field access | |
-| `lwzu/stwu` in loop | `*ptr++` | Load/store with pointer update |
+| `lwzu/stwu` in loop | `*ptr++` | Load/store with pointer update (post-increment) |
+| `stbu/stwu` single | `*++ptr` | Store with update (pre-increment) |
 
 ### Comparisons & Branches
 | Assembly | C Code | Notes |
@@ -76,6 +77,7 @@ Write C code that compiles to a 100% binary-identical match with the target asse
 | `fneg f1, f1` | `-float_var` | Float negation |
 | `lfs` from `.sdata2` | `1.0F` literal | Single precision |
 | `lfd` from `.rodata` | `1.0` literal | Double precision (no F) |
+| `lfs` for abs comparison | `__fabsf(x)` | Float-precision abs (vs `fabsf`/`fabs` which use `lfd`) |
 
 ### Bitfields & Switches
 | Assembly | C Code | Notes |
@@ -99,6 +101,7 @@ Write C code that compiles to a 100% binary-identical match with the target asse
 | **95-99%** | Declaration order | Swap variable declaration order at top of function |
 | **99%+** | Register allocation | Try `x += y` vs `x = x + y`, reorder declarations, compound assignment |
 | **Compile error** | C89 violation | Move declarations to block start, fix types |
+| **FP reg cascade** | Builtin inline unwanted | If target calls `fmod`/`fabs` as `bl` but mwcc inlines, add `float fmod(float, float);` forward decl to suppress builtin |
 
 ## Register Allocation (99%+ Fixes)
 
@@ -151,7 +154,7 @@ Type punning creates fragile matches that break when structs are properly fixed.
 ### No Raw Offset Access
 **NEVER use `*(s32*)((u8*)&ip->xDD4_itemVar + 0x50)` patterns.**
 
-This indicates a missing struct field. Leave a comment noting what field is needed at what offset.
+This indicates a missing struct field. Use `M2C_FIELD` as a fallback (m2c `--valid-syntax` generates these), but defining the actual struct field is always preferred.
 
 ### No Sandbox Metadata Comments
 **Strip all sandbox/m2c metadata comments before integration:**
@@ -210,6 +213,29 @@ For zeroing velocity, prefer:
 ip->x40_vel.x = ip->x40_vel.y = ip->x40_vel.z = 0.0F;
 ```
 Over separate assignments (matches the original style better).
+
+### Float Literals in Function Arguments
+**Use proper float/pointer types in function call arguments**, not bare integers:
+```c
+// ❌ BAD
+Fighter_ChangeMotionState(gobj, 0x16A, 0, fp->cur_anim_frame, 1, 0, 0);
+
+// ✓ GOOD
+Fighter_ChangeMotionState(gobj, 0x16A, 0, fp->cur_anim_frame, 1.0F, 0.0F, NULL);
+```
+
+### Unnecessary Casts
+**Fix function signatures at their declaration/definition** rather than adding casts at call sites:
+```c
+// ❌ BAD - casting to paper over type mismatch
+doSomething((HSD_GObj*) gobj);  // gobj is already Item_GObj*
+
+// ✓ GOOD - no cast needed
+doSomething(gobj);
+```
+
+### Boolean Style
+Use `bool`/`true`/`false`, not `BOOL`/`TRUE`/`FALSE`.
 
 ## Item Functions
 
